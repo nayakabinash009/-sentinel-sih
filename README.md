@@ -18,6 +18,24 @@ human decision and executed action is written to an append-only ledger,
 hash-chained with SHA-256 and signed with Ed25519, so the audit trail can be
 verified after the fact rather than taken on trust.
 
+## Project at a glance
+
+| Area | Implementation |
+|---|---|
+| Backend | FastAPI, SQLAlchemy |
+| Frontend | React, TypeScript, Vite |
+| Detection and correlation | Sigma rules, entity graph, kill-chain scoring |
+| AI investigation | Independent deterministic and LLM analysis paths |
+| Governance | Policy-based Tier 0–3 controls with human approval for sensitive actions |
+| Auditability | Append-only, SHA-256 hash-chained ledger with Ed25519 signatures |
+| Real-time interface | REST API and WebSocket updates |
+
+**What makes Sentinel different:** AI produces investigation and response recommendations, while policy and authenticated human approvals govern sensitive actions. The model does not decide its own authorization tier.
+
+**Demo scope:** The Live Threat Response Demo uses simulated telemetry and simulated response execution. It is a prototype showcase, not a production security-control system and does not contain real endpoint containment.
+
+**Repository map:** [backend/](backend/) contains the FastAPI service; [frontend/](frontend/) contains the React SOC console. Detailed backend notes are linked in [Architecture notes](#architecture-notes).
+
 This repo holds both halves of the system:
 
 ```
@@ -539,3 +557,10 @@ For the full endpoint-by-endpoint architecture writeup, see
 [`backend/README.md`](backend/README.md),
 [`backend/ANALYSIS.md`](backend/ANALYSIS.md), and
 [`backend/FEATURE_COVERAGE.md`](backend/FEATURE_COVERAGE.md).
+
+
+---
+
+## Maintainer
+
+Maintained in the GitHub account [@nayakabinash009](https://github.com/nayakabinash009).
