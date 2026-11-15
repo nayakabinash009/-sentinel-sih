@@ -1,0 +1,589 @@
+"""Everything the dashboard displays.
+
+One time-series service feeds four separate UI features: the threat activity
+chart, the KPI sparklines, the "12% from yesterday" deltas, and the source
+donut. Build it once.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import func
+from sqlalchemy import text as sa_text
+from sqlalchemy.orm import Session
+
+from app.db import counters
+from app.models import (Action, Alert, Event, Incident, MetricPoint,
+                        PlaybookUsage)
+
+log = logging.getLogger(__name__)
+
+WINDOWS = {"1h": 1, "6h": 6, "24h": 24, "7d": 168}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  KPI CARDS
+# ══════════════════════════════════════════════════════════════════════
+
+def kpis(s: Session) -> dict:
+    open_incidents = s.query(Incident).filter(Incident.status == "open").count()
+    critical = (s.query(Incident)
+                 .filter(Incident.status == "open",
+                         Incident.risk_score >= 80).count())
+    pending = s.query(Action).filter(Action.status == "pending").count()
+    events = s.query(Event).count()
+    alerts = s.query(Alert).count()
+
+    injections = (s.query(Alert)
+                   .filter(Alert.rule_id == "INJECTION_ATTEMPT").count())
+
+    # Share of decided actions a human let stand. `rolled_back` counts as
+    # decided but not as approved — an action undone after the fact is
+    # precisely the case where the recommendation turned out to be wrong,
+    # so counting it as agreement would flatter the number.
+    decided = s.query(Action).filter(
+        Action.status.in_(["executed", "rejected", "rolled_back"])).count()
+    approved = s.query(Action).filter(Action.status == "executed").count()
+    # None, not 85. There was no basis for 85 — it was a plausible-looking
+    # number standing in for a measurement that had not been taken, on a
+    # panel whose whole claim is that its numbers are measured. The UI can
+    # say "not enough decisions yet"; it cannot un-see a fabricated 85.
+    trust = round(approved / decided * 100) if decided else None
+
+    # The dashboard's risk gauge is the single worst open incident. It was
+    # labelled "AI Risk Score" while being read straight off the
+    # deterministic kill-chain arithmetic — on this database the worst
+    # incident scores 100 with an `ai_score_delta` of 0.0, so the number
+    # under that label had no AI in it at all. Return the decomposition so
+    # the panel can say which part came from where instead of crediting all
+    # of it to the model.
+    worst = (s.query(Incident)
+              .filter(Incident.status == "open")
+              .order_by(Incident.risk_score.desc()).first())
+    risk = {
+        "worst_score": round(worst.risk_score, 1) if worst else None,
+        "deterministic": round(worst.base_score or 0.0, 1) if worst else None,
+        "ai_delta": round(worst.ai_score_delta or 0.0, 1) if worst else None,
+        "incident_id": worst.incident_id if worst else None,
+        "open_incidents": open_incidents,
+    }
+
+    return {
+        "open_incidents": open_incidents,
+        "critical_alerts": critical,
+        "pending_approvals": pending,
+        "adversarial_attempts": injections,
+        "trust_score": trust,
+        "risk": risk,
+        "events_processed": events,
+        "alerts_raised": alerts,
+        # the subtitle that carries the whole value proposition
+        "compression": {
+            "events": events, "alerts": alerts, "incidents": open_incidents,
+            "label": f"from {events:,} events and {alerts:,} alerts",
+        },
+        "system_health": health_score(s),
+        "live": counters.snapshot(),
+    }
+
+
+def deltas(s: Session) -> dict:
+    """"↗ 12% from yesterday" — comparing two equal windows."""
+    now = datetime.now(timezone.utc)
+    out = {}
+    for metric in ("events", "alerts", "incidents", "injections"):
+        cur = _sum(s, metric, now - timedelta(hours=24), now)
+        prev = _sum(s, metric, now - timedelta(hours=48), now - timedelta(hours=24))
+        if prev:
+            out[metric] = round((cur - prev) / prev * 100, 1)
+        else:
+            out[metric] = None          # hide rather than invent a comparison
+    return out
+
+
+def _sum(s: Session, metric: str, start: datetime, end: datetime) -> int:
+    return (s.query(func.coalesce(func.sum(MetricPoint.value), 0))
+             .filter(MetricPoint.metric == metric,
+                     MetricPoint.bucket >= start,
+                     MetricPoint.bucket < end).scalar() or 0)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  TIME SERIES  —  chart · sparklines · donut
+# ══════════════════════════════════════════════════════════════════════
+
+def timeseries(s: Session, metric: str = "alerts", window: str = "24h",
+               bucket_hours: int = 1, group_by: str | None = None) -> dict:
+    hours = WINDOWS.get(window, 24)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours)
+
+    q = (s.query(MetricPoint)
+          .filter(MetricPoint.metric == metric,
+                  MetricPoint.bucket >= start))
+    rows = q.all()
+
+    labels, index = [], {}
+    t = start.replace(minute=0, second=0, microsecond=0)
+    while t <= end:
+        labels.append(t.strftime("%I %p").lstrip("0"))
+        index[t.replace(tzinfo=timezone.utc)] = len(labels) - 1
+        t += timedelta(hours=bucket_hours)
+
+    series: dict[str, list[int]] = {}
+    for r in rows:
+        key = r.dimension if group_by else "total"
+        series.setdefault(key, [0] * len(labels))
+        b = r.bucket.replace(minute=0, second=0, microsecond=0,
+                             tzinfo=timezone.utc)
+        if b in index:
+            series[key][index[b]] += r.value
+
+    if not series:
+        series = {"total": [0] * len(labels)}
+
+    return {"buckets": labels,
+            "series": [{"name": k, "values": v} for k, v in series.items()]}
+
+
+def source_breakdown(s: Session) -> list[dict]:
+    """The 'Top Threat Types' donut."""
+    rows = (s.query(Alert.technique, func.count(Alert.alert_id))
+             .group_by(Alert.technique).all())
+    label = {
+        "T1566.001": "Phishing", "T1204.002": "Phishing",
+        "T1078": "Identity Abuse", "T1003.001": "Identity Abuse",
+        "T1087.002": "Identity Abuse",
+        "T1486": "Malware", "T1490": "Malware", "T1059.001": "Malware",
+        "T1565": "Adversarial Content",
+    }
+    agg: dict[str, int] = {}
+    for tech, n in rows:
+        agg[label.get(tech or "", "Other")] = agg.get(label.get(tech or "", "Other"), 0) + n
+
+    total = sum(agg.values()) or 1
+    return sorted(
+        [{"name": k, "value": v, "percent": round(v / total * 100)}
+         for k, v in agg.items()],
+        key=lambda d: -d["value"])
+
+
+def flush_counters(s: Session) -> None:
+    """Called once a minute — turns live counters into chart history."""
+    bucket = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    snap = counters.snapshot()
+    pairs = [("events", snap["events_processed"]),
+             ("alerts", snap["alerts_raised"]),
+             ("incidents", snap["incidents_open"]),
+             ("injections", snap["injections_blocked"])]
+    for metric, value in pairs:
+        row = s.get(MetricPoint, (bucket, metric, ""))
+        if row:
+            row.value = value
+        else:
+            s.add(MetricPoint(bucket=bucket, metric=metric,
+                              dimension="", value=value))
+    for source, n in snap.get("by_source", {}).items():
+        row = s.get(MetricPoint, (bucket, "alerts", source))
+        if row:
+            row.value = n
+        else:
+            s.add(MetricPoint(bucket=bucket, metric="alerts",
+                              dimension=source, value=n))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SECURITY OPERATIONS SUMMARY
+# ══════════════════════════════════════════════════════════════════════
+
+def ops_summary(s: Session) -> dict:
+    # Exclude the 36 seeded "(historical)" precedent-panel incidents — they
+    # carry fabricated first_seen dates up to 180 days in the past against a
+    # created_at of "whenever bootstrap ran", which would otherwise blow up
+    # MTTD into something like "83 days" and dilute the containment rate
+    # with synthetic statuses that have nothing to do with real operations.
+    incidents = (s.query(Incident)
+                  .filter(~Incident.incident_id.startswith("inc_hist_")).all())
+    contained = [i for i in incidents if i.status in ("contained", "closed")]
+
+    detect_times, respond_times = [], []
+    for inc in incidents:
+        # `created_at` is wall-clock (when the row was written); `first_seen`
+        # is on the *event* clock (synthetic telemetry timestamps). The two
+        # are not the same clock, so subtracting one from the other produced
+        # a meaningless number — and, whenever the event stream ran ahead of
+        # wall time, a negative one. A negative mean-time-to-detect is not a
+        # small inaccuracy; it is a figure that cannot be true, on a panel
+        # whose entire purpose is to be believed.
+        #
+        # Both of these are on the event clock, so the difference is real:
+        # how long the attack went on between its earliest correlated
+        # evidence and its most recent. Detection itself is synchronous
+        # inside process_batch, so per-event latency is sub-second by
+        # construction and is reported separately rather than averaged here.
+        if inc.first_seen and inc.last_seen:
+            span = (inc.last_seen - inc.first_seen).total_seconds()
+            detect_times.append(max(0.0, span))
+    for a in s.query(Action).filter(Action.executed_at.isnot(None)):
+        if a.requested_at:
+            respond_times.append((a.executed_at - a.requested_at).total_seconds())
+
+    return {
+        "events_processed": s.query(Event).count(),
+        "incidents_open": s.query(Incident)
+                           .filter(Incident.status == "open").count(),
+        "mttd_seconds": round(sum(detect_times) / len(detect_times))
+                        if detect_times else 0,
+        "mttr_seconds": round(sum(respond_times) / len(respond_times))
+                        if respond_times else 0,
+        "containment_rate": round(len(contained) / len(incidents) * 100, 1)
+                            if incidents else 0.0,
+        "ingestion_rate": counters.events,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  THREAT MAP  —  the topology panel
+# ══════════════════════════════════════════════════════════════════════
+
+def threat_map(s: Session) -> dict:
+    """Nodes and links, coloured by whether an open incident touches them."""
+    from app.models import Host
+
+    hosts = s.query(Host).all()
+    involved: set[str] = set()
+    severity: dict[str, str] = {}
+
+    for inc in s.query(Incident).filter(Incident.status == "open"):
+        for e in inc.entity_ids:
+            if e.startswith("host:"):
+                name = e.split(":", 1)[1]
+                involved.add(name)
+                level = "critical" if inc.risk_score >= 80 else "high"
+                if severity.get(name) != "critical":
+                    severity[name] = level
+
+    nodes, links = [], []
+    for h in hosts:
+        is_hub = h.id in ("DC-01", "FILESERVER-01", "MAIL-RELAY")
+        nodes.append({
+            "id": h.id, "label": h.id,
+            "kind": "server" if is_hub else "workstation",
+            "status": severity.get(h.id, "healthy"),
+            "department": h.department,
+        })
+        if not is_hub:
+            links.append({"source": h.id, "target": "DC-01",
+                          "active": h.id in involved})
+
+    return {"nodes": nodes, "links": links,
+            "counts": {"critical": sum(1 for v in severity.values()
+                                       if v == "critical"),
+                       "high": sum(1 for v in severity.values() if v == "high")}}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  HEALTH  —  a real check, not a hardcoded 98%
+# ══════════════════════════════════════════════════════════════════════
+
+def benchmark(s: Session, run_id: str | None = None) -> dict:
+    """Detection rate against ground truth we generated ourselves.
+
+    Every attack event carries `truth_technique` — the technique it was
+    written to represent. No detection rule reads that field, so comparing
+    it against what actually fired is a real measurement rather than a
+    circular one.
+
+    Almost no student project can produce this number. It is worth more
+    than another feature.
+    """
+    planted = (s.query(Event).filter(Event.truth_technique.isnot(None))
+                .filter(Event.run_id == run_id) if run_id else
+               s.query(Event).filter(Event.truth_technique.isnot(None))).all()
+
+    if not planted:
+        return {"status": "no_labelled_events",
+                "note": "Run the demo — attack events are labelled as they "
+                        "are generated."}
+
+    truth_of = {e.event_id: e.truth_technique for e in planted}
+    planted_ids = set(truth_of)
+
+    by_technique: dict[str, dict] = {}
+    for t in truth_of.values():
+        by_technique.setdefault(t, {"planted": 0, "detected": 0})
+    for t in truth_of.values():
+        by_technique[t]["planted"] += 1
+
+    # One event can fire several rules. Count distinct events detected, not
+    # alerts raised, or a noisy event scores above 100% recall.
+    alerts = s.query(Alert).all()
+    detected_ids: set[str] = set()
+    named_right: dict[str, set[str]] = {}
+    for a in alerts:
+        for eid in (a.event_ids or []):
+            if eid not in planted_ids:
+                continue
+            detected_ids.add(eid)
+            truth = truth_of[eid]
+            if a.technique == truth:
+                named_right.setdefault(truth, set()).add(eid)
+
+    for eid in detected_ids:
+        by_technique[truth_of[eid]]["detected"] += 1
+
+    correct_technique = {t: len(v) for t, v in named_right.items()}
+    hit = [t for t, v in by_technique.items() if v["detected"] > 0]
+    missed = sorted(t for t, v in by_technique.items() if v["detected"] == 0)
+
+    # False positives: alerts on events we did not plant. On a synthetic
+    # run every unplanted event is by construction benign.
+    fp = sum(1 for a in alerts
+             if a.origin in ("rule", "injection")
+             and not (set(a.event_ids or []) & planted_ids))
+    total_events = s.query(Event).count()
+
+    return {
+        "status": "ok",
+        "techniques": {
+            "planted": len(by_technique),
+            "detected": len(hit),
+            "recall": round(len(hit) / len(by_technique), 3),
+            "missed": missed,
+        },
+        "events": {
+            "planted": len(planted_ids),
+            "detected": len(detected_ids),
+            "recall": round(len(detected_ids) / len(planted_ids), 3),
+        },
+        "false_positives": {
+            "alerts_on_benign_events": fp,
+            "benign_events": total_events - len(planted_ids),
+            "rate": round(fp / max(total_events - len(planted_ids), 1), 5),
+        },
+        "per_technique": {
+            t: {**v,
+                "named_correctly": correct_technique.get(t, 0),
+                "recall": round(v["detected"] / v["planted"], 2)}
+            for t, v in sorted(by_technique.items())
+        },
+        "note": ("Ground truth is stamped on each attack event at generation "
+                 "time and read by nothing except this endpoint. A missed "
+                 "technique is named rather than hidden."),
+    }
+
+
+def health_score(s: Session) -> dict:
+    from app.llm import router
+    from app.services import governance
+
+    status = router.provider_status()
+    any_provider = any(p["available"] for p in status["providers"].values())
+
+    # `database` used to be the literal `True`, which made it the one check
+    # that could never fail and so the one check that meant nothing. A
+    # trivial round trip is not much, but it is an actual round trip: it
+    # catches a locked SQLite file or a dropped Postgres connection, which
+    # is exactly the condition the panel claims to be reporting on.
+    try:
+        s.execute(sa_text("SELECT 1")).scalar()
+        database_ok = True
+    except Exception:                                # noqa: BLE001
+        log.exception("database health check failed")
+        database_ok = False
+
+    checks = {
+        "database": database_ok,
+        "ai_provider": any_provider or not status["ai_enabled"],
+        "rules_loaded": s.query(func.count()).select_from(
+            __import__("app.models", fromlist=["Rule"]).Rule).scalar() > 0,
+        "ledger_verified": governance.verify_chain(s)["valid"],
+    }
+    score = round(100 * sum(checks.values()) / len(checks))
+    # Four booleans, so the score only ever lands on 0/25/50/75/100. Name
+    # the checks in the response rather than leaning on the number alone —
+    # "3 of 4" is a fact, "75%" invites reading it as a continuous measure
+    # of something it does not measure.
+    failed = [k for k, v in checks.items() if not v]
+    return {"score": score, "checks": checks,
+            "checks_passed": sum(checks.values()), "checks_total": len(checks),
+            "ai": status,
+            "label": "All systems operational" if score == 100
+                     else "Degraded: " + ", ".join(f.replace("_", " ") for f in failed)}
+
+
+def playbook_stats(s: Session) -> list[dict]:
+    rows = s.query(PlaybookUsage).all()
+    total = sum(r.matched_count for r in rows) or 1
+    return sorted(
+        [{"id": r.playbook_id, "name": r.name or r.playbook_id,
+          "used": r.matched_count, "executed": r.executed_count,
+          "share": round(r.matched_count / total * 100),
+          "last_used": r.last_used.isoformat() if r.last_used else None}
+         for r in rows],
+        key=lambda d: -d["used"])
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  QUANTITATIVE PERFORMANCE MATRIX
+#
+#  Every figure here is measured against something the system did not
+#  choose for itself. Detection is scored against `truth_technique`, which
+#  is stamped on attack events at generation and which no detection rule
+#  reads — so recall is a real measurement rather than the system grading
+#  its own homework. Analyst agreement is counted from decisions humans
+#  actually made. The governance figures are counted from the action table.
+#
+#  Where something genuinely cannot be measured yet — no run has been
+#  labelled, nobody has approved anything — the metric returns None and the
+#  interface says so, rather than showing a plausible number. A panel that
+#  exists to demonstrate rigour cannot afford an invented figure on it, and
+#  "not measured yet" is a perfectly respectable answer.
+# ══════════════════════════════════════════════════════════════════════
+
+def performance_matrix(s: Session) -> dict:
+    from app import config
+    from app.services.pipeline import RULES
+
+    bench = benchmark(s)
+    ops = ops_summary(s)
+    labelled = bench.get("status") == "ok"
+
+    tech = bench.get("techniques", {}) if labelled else {}
+    evts = bench.get("events", {}) if labelled else {}
+    fps = bench.get("false_positives", {}) if labelled else {}
+
+    # How much of the technique catalogue the written rules actually
+    # address — counted from the rules, not asserted in a slide.
+    rule_techniques = {r.technique for r in RULES if r.technique}
+    catalogue = set(config.TECHNIQUE_CATALOGUE)
+    coverage = (len(rule_techniques & catalogue) / len(catalogue)
+                if catalogue else None)
+
+    events = s.query(Event).count()
+    alerts = s.query(Alert).count()
+    open_inc = s.query(Incident).filter(Incident.status == "open").count()
+
+    decided = s.query(Action).filter(
+        Action.status.in_(["executed", "rejected", "rolled_back"])).count()
+    accepted = s.query(Action).filter(Action.status == "executed").count()
+
+    # The governance invariant the whole project rests on: nothing at tier 2
+    # or above ever executed without a named human on it. This counts
+    # violations, so the expected answer is zero — and a non-zero number
+    # would be the most important thing on the page.
+    high_tier = s.query(Action).filter(
+        Action.tier >= 2, Action.status == "executed").all()
+    unapproved = [a for a in high_tier if not (a.approved_by or [])]
+    tier3 = [a for a in high_tier if a.tier >= 3]
+    tier3_bad = [a for a in tier3 if len(set(a.approved_by or [])) < 2]
+
+    ai_alerts = s.query(Alert).filter(
+        Alert.origin.in_(["ai_triage", "ai_analysis"])).count()
+    ai_over_cap = s.query(Alert).filter(
+        Alert.origin.in_(["ai_triage", "ai_analysis"]),
+        Alert.severity.in_(["high", "critical"])).count()
+    injections = s.query(Alert).filter(
+        Alert.rule_id == "INJECTION_ATTEMPT").count()
+
+    scored = s.query(Incident).filter(Incident.ai_score_delta.isnot(None)).all()
+    moved = [i for i in scored if (i.ai_score_delta or 0) != 0]
+    mean_delta = (round(sum(abs(i.ai_score_delta or 0) for i in moved)
+                        / len(moved), 1) if moved else 0.0)
+
+    def pct(x):
+        return None if x is None else round(x * 100, 1)
+
+    def m(key, label, value, target, higher, unit, basis, note=""):
+        return {"key": key, "label": label, "value": value, "target": target,
+                "higher_is_better": higher, "unit": unit, "basis": basis,
+                "note": note}
+
+    no_run = "no labelled run yet"
+    metrics = [
+        m("technique_recall", "Technique detection recall",
+          pct(tech.get("recall")) if labelled else None, 95.0, True, "%",
+          ("%d of %d planted techniques detected"
+           % (tech.get("detected", 0), tech.get("planted", 0)))
+          if labelled else no_run,
+          "Scored against ground truth that no detection rule can read."),
+        m("event_recall", "Attack-event recall",
+          pct(evts.get("recall")) if labelled else None, 80.0, True, "%",
+          ("%d of %d attack events raised an alert"
+           % (evts.get("detected", 0), evts.get("planted", 0)))
+          if labelled else no_run,
+          "Lower than technique recall by design — a technique only has to "
+          "be caught once to be caught."),
+        m("false_positive_rate", "False-positive rate",
+          pct(fps.get("rate")) if labelled else None, 5.0, False, "%",
+          ("{:,} alerts across {:,} benign events".format(
+              fps.get("alerts_on_benign_events", 0),
+              fps.get("benign_events", 0)))
+          if labelled else no_run,
+          "On a synthetic run every unplanted event is benign by "
+          "construction, so this is exact rather than estimated."),
+        m("catalogue_coverage", "ATT&CK catalogue coverage",
+          pct(coverage), 80.0, True, "%",
+          "%d of %d catalogued techniques have a written rule"
+          % (len(rule_techniques & catalogue), len(catalogue)),
+          "Counted from the rules themselves."),
+        m("triage_reduction", "Triage reduction",
+          round((1 - open_inc / events) * 100, 3) if events else None,
+          99.0, True, "%",
+          "{:,} events to {:,} alerts to {:,} open incidents".format(
+              events, alerts, open_inc),
+          "What an analyst is actually asked to look at."),
+        m("mttr_seconds", "Mean time to respond",
+          ops.get("mttr_seconds"), 30.0, False, "s",
+          "request to execution, wall clock",
+          "Measured across every executed action."),
+        m("detection_span", "Mean incident span",
+          ops.get("mttd_seconds"), None, False, "s",
+          "first correlated evidence to latest, event clock",
+          "Per-event detection is synchronous and sub-second; this is how "
+          "long an attack ran before its picture was complete."),
+        m("analyst_agreement", "Analyst agreement",
+          round(accepted / decided * 100, 1) if decided else None,
+          85.0, True, "%",
+          ("%d of %d decided actions let stand" % (accepted, decided))
+          if decided else "no decisions yet",
+          "Rolled-back actions count as decided but not as accepted."),
+    ]
+
+    governance = [
+        {"key": "tier2_unapproved",
+         "label": "Tier 2+ executed without approval",
+         "value": len(unapproved), "expected": 0,
+         "basis": "checked %d executed tier-2+ actions" % len(high_tier),
+         "ok": len(unapproved) == 0},
+        {"key": "tier3_single_signer",
+         "label": "Tier 3 executed with one signer",
+         "value": len(tier3_bad), "expected": 0,
+         "basis": "checked %d executed tier-3 actions" % len(tier3),
+         "ok": len(tier3_bad) == 0},
+        {"key": "ai_over_severity_cap",
+         "label": "AI alerts above the severity cap",
+         "value": ai_over_cap, "expected": 0,
+         "basis": "checked %d AI-raised alerts against a %s ceiling"
+                  % (ai_alerts, config.TRIAGE_MAX_SEVERITY),
+         "ok": ai_over_cap == 0},
+    ]
+
+    return {
+        "metrics": metrics,
+        "governance": governance,
+        "ai": {
+            "alerts_raised": ai_alerts,
+            "injections_blocked": injections,
+            "incidents_scored": len(scored),
+            "incidents_moved": len(moved),
+            "mean_abs_delta": mean_delta,
+            "clamp_up": config.AI_SCORE_MAX_UP,
+            "clamp_down": config.AI_SCORE_MAX_DOWN,
+        },
+        "volume": {"events": events, "alerts": alerts,
+                   "open_incidents": open_inc},
+        "labelled_run": labelled,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
